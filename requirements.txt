@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-multipart
+jinja2
+pydub
+whisper
+faster-whisper
+torch
+ffmpeg-python
+requests
+scipy
+diffusers
+librosa
+numpy
