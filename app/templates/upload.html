@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Upload Audio</title>
+</head>
+<body>
+  <h1>Upload Audio File</h1>
+  <form action="{{ endpoint }}" method="post" enctype="multipart/form-data">
+    <input type="file" name="audio" accept="audio/*" required />
+    <button type="submit">Upload and Transcribe</button>
+  </form>
+</body>
+</html>
