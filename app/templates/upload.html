@@ -1,14 +1,18 @@
+<!-- templates/upload.html -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <title>Upload Audio</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
 </head>
 <body>
-  <h1>Upload Audio File</h1>
-  <form action="{{ endpoint }}" method="post" enctype="multipart/form-data">
-    <input type="file" name="audio" accept="audio/*" required />
-    <button type="submit">Upload and Transcribe</button>
-  </form>
+  <div class="container">
+    <h1>Upload Audio File</h1>
+    <form action="{{ endpoint }}" method="post" enctype="multipart/form-data">
+      <input type="file" name="audio" accept="audio/*" required />
+      <button type="submit">Upload and Transcribe</button>
+    </form>
+  </div>
 </body>
 </html>

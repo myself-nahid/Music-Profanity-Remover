@@ -1,14 +1,28 @@
+<!-- templates/index.html -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <title>Audio Editor</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
 </head>
 <body>
-    <h1>Choose an Audio Editing Tool</h1>
-    <ul>
-        <li><a href="/instrumental-remover"><h2>Instrumental Word Remover</h2></a><p>Replaces selected words with generated instrumental music.</p></li>
-        <li><a href="/dj-tag-remover"><h2>DJ Tag Word Remover</h2></a><p>Replaces selected words with a predefined DJ tag.</p></li>
-    </ul>
+    <div class="container">
+        <h1>Choose an Audio Editing Tool</h1>
+        <ul class="tool-list">
+            <li>
+                <a href="/instrumental-remover">
+                    <h2>Instrumental Word Remover</h2>
+                    <p>Replaces selected words with generated instrumental music.</p>
+                </a>
+            </li>
+            <li>
+                <a href="/dj-tag-remover">
+                    <h2>DJ Tag Word Remover</h2>
+                    <p>Replaces selected words with a predefined DJ tag.</p>
+                </a>
+            </li>
+        </ul>
+    </div>
 </body>
 </html>

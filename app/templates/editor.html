@@ -1,30 +1,33 @@
+<!-- templates/editor.html -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <title>Edit Transcript</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
 </head>
 <body>
-  <h1>Select Words to Remove</h1>
-  <form action="{{ endpoint }}" method="post">
-    <input type="hidden" name="orig_path" value="{{ orig_path }}" />
+  <div class="container">
+    <h1>Select Words to Remove</h1>
+    <form action="{{ endpoint }}" method="post">
+      <input type="hidden" name="orig_path" value="{{ orig_path }}" />
 
-    <ul style="list-style:none; max-height:400px; overflow-y:scroll;">
-      {% for w in words %}
-      <li>
-        <label>
-          <input type="checkbox" name="remove" value="{{ w.idx }}" />
-          {{ w.text }}
-        </label>
-        <input type="hidden" name="idx" value="{{ w.idx }}" />
-        <input type="hidden" name="start" value="{{ w.start }}" />
-        <input type="hidden" name="end" value="{{ w.end }}" />
-        <input type="hidden" name="text" value="{{ w.text }}" />
-      </li>
-      {% endfor %}
-    </ul>
+      <ul class="editor-list">
+        {% for w in words %}
+        <li>
+          <label>
+            <input type="checkbox" name="remove" value="{{ w.idx }}" />
+            {{ w.text }}
+          </label>
+          <input type="hidden" name="idx" value="{{ w.idx }}" />
+          <input type="hidden" name="start" value="{{ w.start }}" />
+          <input type="hidden" name="end" value="{{ w.end }}" />
+        </li>
+        {% endfor %}
+      </ul>
 
-    <button type="submit">Process Removal</button>
-  </form>
+      <button type="submit">Process and Download</button>
+    </form>
+  </div>
 </body>
 </html>
