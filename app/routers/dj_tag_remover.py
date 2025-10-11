@@ -16,7 +16,7 @@ from ..dependencies import get_transcription_model
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
 # Path to the DJ tag audio file
-DJ_TAG_PATH = 'C:\\Users\\uddub\\Downloads\\dj dj gudda.mp3'
+DJ_TAG_PATH = 'C:\\Users\\nahid\\Desktop\\JVai-up\\Music-Profanity-Remover\\dj\\dj dj gudda.mp3'
 
 # Load DJ tag into memory
 try:
