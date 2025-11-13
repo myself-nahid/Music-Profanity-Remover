@@ -19,11 +19,25 @@ from faster_whisper import WhisperModel
 from ..dependencies import get_transcription_model, get_instrumental_cache, get_transcript_cache
 
 # --- Pre-load DJ Tag ---
-DJ_TAG_PATH = 'C:\\Users\\nahid\\Desktop\\JVai-up\\Music-Profanity-Remover\\dj\\dj dj gudda.mp3' 
+# Use environment variable or relative path
+DJ_TAG_PATH = os.getenv(
+    'DJ_TAG_PATH', 
+    os.path.join(os.path.dirname(__file__), '..', '..', 'dj', 'dj dj gudda.mp3')
+)
+
+DJ_TAG = None
+DJ_TAG_ERROR = None
+
 try:
-    DJ_TAG = AudioSegment.from_file(DJ_TAG_PATH).normalize()
-except FileNotFoundError:
-    DJ_TAG = None
+    if os.path.exists(DJ_TAG_PATH):
+        DJ_TAG = AudioSegment.from_file(DJ_TAG_PATH).normalize()
+        print(f"✓ DJ Tag loaded successfully from: {DJ_TAG_PATH}")
+    else:
+        DJ_TAG_ERROR = f"DJ Tag file not found at: {DJ_TAG_PATH}"
+        print(f"✗ {DJ_TAG_ERROR}")
+except Exception as e:
+    DJ_TAG_ERROR = f"Failed to load DJ Tag: {str(e)}"
+    print(f"✗ {DJ_TAG_ERROR}")
 
 # new versioned router
 router = APIRouter(
@@ -126,9 +140,17 @@ async def api_process_dj_tag_v2(
     request: ProcessRequest, # Use the Pydantic model
     transcript_cache: dict = Depends(get_transcript_cache),
 ):
-    """Step 2: Process audio with a simple JSON payload."""
+    """Step 2: Process audio with DJ tag replacement."""
     if DJ_TAG is None:
-        raise HTTPException(status_code=500, detail="DJ Tag audio file is not loaded on the server.")
+        error_msg = DJ_TAG_ERROR or "DJ Tag audio file is not loaded on the server."
+        raise HTTPException(
+            status_code=503,  # Service Unavailable
+            detail={
+                "error": error_msg,
+                "dj_tag_path": DJ_TAG_PATH,
+                "solution": "Please set DJ_TAG_PATH environment variable or ensure the file exists at the default location"
+            }
+        )
 
     orig_path = request.orig_path
     
@@ -153,3 +175,14 @@ async def api_process_dj_tag_v2(
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as out_fp:
         out.export(out_fp.name, format='mp3')
         return FileResponse(out_fp.name, media_type='audio/mpeg', filename='cleaned_dj_tag.mp3')
+
+
+@router.get("/dj-tag/status")
+async def dj_tag_status():
+    """Check if DJ tag is loaded and available."""
+    return {
+        "loaded": DJ_TAG is not None,
+        "path": DJ_TAG_PATH,
+        "exists": os.path.exists(DJ_TAG_PATH),
+        "error": DJ_TAG_ERROR
+    }
