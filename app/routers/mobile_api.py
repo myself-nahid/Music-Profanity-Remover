@@ -2,9 +2,9 @@ import os
 import tempfile
 import shutil
 import io
-from typing import List, Optional
-from enum import Enum
 import re
+from typing import List, Optional, Tuple
+from enum import Enum
 
 from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -27,20 +27,18 @@ SCRATCH_EFFECT_PATH = os.path.join(BASE_DIR, '..', 'effects', 'scratch.mp3')
 DJ_TAG = None
 SCRATCH_EFFECT = None
 
-# --- UPDATED KILL LIST (Includes Whisper Hallucinations) ---
+# --- CLIENT KILL LIST ---
 BAD_WORDS = {
-    # The Client's List
     "nigga", "niggaz", "nigger", "niggers", 
-    "fuck", "fucking", "fucked", "fucker",
+    "fuck", "fucking", "fucked", "fucker", "motherfucker",
     "bitch", "bitches", 
     "damn", 
     "ass", 
     "hoe", "hoes",
-    "dick", 
+    "dick", "cock",
     "shit", "shitting",
     "pussy", 
     "slut",
-    # Whisper Common Misinterpretations/Hallucinations
     "nicka", "nickas", "nika", "nicker", "fck", "sht", "bih"
 }
 
@@ -66,6 +64,31 @@ def trim_silence(audio_segment, silence_thresh=-50.0):
     )
     return chunks[0] if chunks else audio_segment
 
+def normalize_text(text: str) -> str:
+    """Strict English only to fix 'pussy' bug"""
+    return re.sub(r'[^a-zA-Z\s]', '', text).lower().strip()
+
+def clean_hallucinations(words: List[dict]) -> List[dict]:
+    cleaned = []
+    repetition_count = 0
+    last_text = ""
+    
+    for w in words:
+        duration = w['end'] - w['start']
+        text = normalize_text(w['text'])
+        
+        if duration < 0.05: continue 
+
+        if text == last_text and len(text) > 0:
+            repetition_count += 1
+        else:
+            repetition_count = 0
+            last_text = text
+            
+        if repetition_count > 4: continue
+        cleaned.append(w)
+    return cleaned
+
 def segment_to_numpy(segment: AudioSegment):
     seg_mono = segment.set_channels(1)
     samples = np.array(seg_mono.get_array_of_samples())
@@ -90,12 +113,12 @@ def generate_safety_bed(segment: AudioSegment) -> AudioSegment:
     try:
         y = segment_to_numpy(segment)
         sr = segment.frame_rate
-        # Aggressive Margin 5.0
+        # Aggressive Margin
         y_harm, y_perc = librosa.effects.hpss(y, margin=5.0) 
         
         percussive_bed = numpy_to_audio_segment(y_perc, sr)
         
-        # Low Pass at 600Hz to kill vocal frequencies
+        # Low Pass at 600Hz
         safe_bed = percussive_bed.low_pass_filter(600)
         
         # Duck volume
@@ -107,44 +130,25 @@ def generate_safety_bed(segment: AudioSegment) -> AudioSegment:
         print(f"Separation Error: {e}")
         return AudioSegment.silent(duration=len(segment))
 
-# --- NEW: HALLUCINATION CLEANER ---
-def clean_hallucinations(words: List[dict]) -> List[dict]:
-    """
-    Removes Whisper loop glitches (e.g., 'Nicka' repeating 50 times).
-    Logic: 
-    1. If a word is extremely short (<0.02s) it's likely noise.
-    2. If the exact same text repeats > 3 times with < 0.1s gaps, delete it.
-    """
-    cleaned = []
-    repetition_count = 0
-    last_text = ""
+def merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Merges overlapping timing intervals to prevent audio glitches"""
+    if not intervals:
+        return []
     
-    for w in words:
-        duration = w['end'] - w['start']
-        text = w['text'].lower()
+    # Sort by start time
+    intervals.sort(key=lambda x: x[0])
+    
+    merged = [intervals[0]]
+    for current_start, current_end in intervals[1:]:
+        last_start, last_end = merged[-1]
         
-        # Filter 1: Ghost Words (Zero or Near-Zero Duration)
-        if duration < 0.05: 
-            continue 
-
-        # Filter 2: Infinite Repetition Loop (The "Nicka" Bug)
-        if text == last_text:
-            repetition_count += 1
+        # If overlap or adjacent (within 10ms), merge them
+        if current_start <= last_end + 10:
+            merged[-1] = (last_start, max(last_end, current_end))
         else:
-            repetition_count = 0
-            last_text = text
+            merged.append((current_start, current_end))
             
-        # If the same word appears more than 4 times in a row, stop adding it
-        if repetition_count > 4:
-            continue
-            
-        cleaned.append(w)
-        
-    return cleaned
-
-def normalize_text(text: str) -> str:
-    # Remove punctuation and lowercase
-    return re.sub(r'[^\w\s]', '', text).lower()
+    return merged
 
 # --- ROUTER ---
 router = APIRouter(prefix="/api/v2", tags=["Mobile API v2"])
@@ -178,7 +182,19 @@ async def api_transcribe_audio(
         shutil.copyfileobj(audio.file, temp_file)
         temp_path = temp_file.name
 
-    segments, _ = model.transcribe(temp_path, beam_size=5, word_timestamps=True)
+    # --- CHANGE 2: OPTIMIZED TRANSCRIPTION SETTINGS ---
+    segments, _ = model.transcribe(
+        temp_path, 
+        beam_size=5, 
+        word_timestamps=True,
+        # VAD Filter: Stops it from transcribing the beat as words
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
+        # Prevent Loops: Stops "Nicka Nicka Nicka" repetition
+        condition_on_previous_text=False,
+        # Temperature: Lowers creativity (stick to exactly what is heard)
+        temperature=0.0
+    )
     
     raw_words = []
     for seg in segments:
@@ -191,15 +207,12 @@ async def api_transcribe_audio(
                 'end': w.end
             })
     
-    # STEP 1: Clean Hallucinations (Fixes the json output glitches)
     cleaned_words_data = clean_hallucinations(raw_words)
     
-    # STEP 2: Index and Flag
     final_words = []
     idx = 0
     for w in cleaned_words_data:
         clean_text = normalize_text(w['text'])
-        # Check against BAD_WORDS set
         is_profanity = clean_text in BAD_WORDS
         
         final_words.append({
@@ -221,23 +234,23 @@ async def api_process_precise(
     transcript_cache: dict = Depends(get_transcript_cache),
 ):
     if request.orig_path not in transcript_cache:
-        raise HTTPException(404, "Transcription not found.")
-    
+        raise HTTPException(404, "Transcription not found or expired.")
     if not os.path.exists(request.orig_path):
-        raise HTTPException(404, "Audio file not found.")
+        raise HTTPException(404, "Audio file not found on server.")
 
     all_words = transcript_cache[request.orig_path]
-    indices = set(request.remove_indices)
+    target_indices = set(request.remove_indices)
     
     if request.max_effects:
-        indices = set(sorted(list(indices))[:request.max_effects])
+        target_indices = set(sorted(list(target_indices))[:request.max_effects])
     
-    words_to_process = [w for w in all_words if w['idx'] in indices]
+    # Identify the specific words selected
+    words_to_process = [w for w in all_words if w['idx'] in target_indices]
     
     try:
         base_track = AudioSegment.from_file(request.orig_path)
     except Exception:
-        raise HTTPException(500, "Could not load audio.")
+        raise HTTPException(500, "Could not load audio file.")
 
     librosa_y = None
     librosa_sr = base_track.frame_rate
@@ -245,25 +258,38 @@ async def api_process_precise(
         librosa_y, librosa_sr = librosa.load(request.orig_path, sr=librosa_sr)
 
     output_track = base_track
+    PAD = 150 # 150ms Padding
 
-    # --- PASS 1: SAFETY CUT ---
+    # --- PHASE 1: CALCULATE & MERGE CUT INTERVALS ---
+    # We calculate the start/end (with padding) for every word, then merge them.
+    # This treats "Damn it" as one cut instead of two overlapping cuts.
+    
+    raw_intervals = []
     for word in words_to_process:
         s_ms = int(word['start'] * 1000)
         e_ms = int(word['end'] * 1000)
         
-        # AGGRESSIVE PADDING 150ms
-        pad = 150 
-        s_ms = max(0, s_ms - pad)
-        e_ms = min(len(base_track), e_ms + pad)
+        s_ms = max(0, s_ms - PAD)
+        e_ms = min(len(base_track), e_ms + PAD)
+        raw_intervals.append((s_ms, e_ms))
+    
+    # Consolidate overlapping cuts
+    merged_intervals = merge_intervals(raw_intervals)
+    
+    # REVERSE SORT: Process from End to Start to maintain index integrity
+    merged_intervals.sort(key=lambda x: x[0], reverse=True)
+
+    # --- PHASE 2: EXECUTE CUTS (The Clean Mute) ---
+    for s_ms, e_ms in merged_intervals:
         duration_ms = e_ms - s_ms
-        
         original_segment = base_track[s_ms:e_ms]
         
-        # Generate Safety Bed (Filtered)
+        # 1. Generate Bed
         replacement_chunk = generate_safety_bed(original_segment)
         
-        # Vocal Scramble Overlay
+        # 2. Vocal Scramble (If needed, we just add it to the whole chunk)
         if request.effect_type == EffectType.VOCAL_SCRAMBLE and librosa_y is not None:
+            # We approximate the scramble across the whole merged chunk
             start_sample = int((s_ms / 1000.0) * librosa_sr)
             end_sample = int((e_ms / 1000.0) * librosa_sr)
             y_slice = librosa_y[start_sample:end_sample]
@@ -274,19 +300,25 @@ async def api_process_precise(
                 scrambled = vocal_seg.reverse() - 2.0
                 replacement_chunk = replacement_chunk.overlay(scrambled)
 
+        # 3. Micro-Fades
         fade_len = 15
         if len(replacement_chunk) > 30:
             replacement_chunk = replacement_chunk.fade_in(fade_len).fade_out(fade_len)
         
+        # 4. Fit Length
         if len(replacement_chunk) != duration_ms:
             if len(replacement_chunk) > duration_ms:
                 replacement_chunk = replacement_chunk[:duration_ms]
             else:
                 replacement_chunk += AudioSegment.silent(duration=duration_ms - len(replacement_chunk))
 
+        # 5. Apply
         output_track = output_track[:s_ms] + replacement_chunk + output_track[e_ms:]
 
-    # --- PASS 2: DJ TAG ---
+    # --- PHASE 3: APPLY TAGS (On Top of the Cuts) ---
+    # We use the ORIGINAL word locations for tags, not the merged intervals.
+    # We sort normally here so tags are applied start-to-end (doesn't matter for overlay)
+    
     if request.effect_type in [EffectType.DJ_TAG, EffectType.DJ_SCRATCH]:
         effect_sound = None
         if request.effect_type == EffectType.DJ_TAG and DJ_TAG:
@@ -296,15 +328,16 @@ async def api_process_precise(
 
         if effect_sound:
             for word in words_to_process:
-                # Start tag early to cover transition
-                s_ms = max(0, int(word['start'] * 1000) - 150)
+                # Start tag at the beginning of the padding for that specific word
+                s_ms = max(0, int(word['start'] * 1000) - PAD)
                 output_track = output_track.overlay(effect_sound, position=s_ms)
 
     # --- EXPORT ---
     if output_track.dBFS > -0.5:
         output_track = output_track.normalize(headroom=0.5)
 
-    out_filename = f'final_{request.effect_type.value}_{len(indices)}.mp3'
+    # FIX: Use len(target_indices) instead of len(indices)
+    out_filename = f'final_{request.effect_type.value}_{len(target_indices)}.mp3'
     
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as out_fp:
         output_track.export(out_fp.name, format='mp3', bitrate='320k', parameters=["-q:a", "0"])

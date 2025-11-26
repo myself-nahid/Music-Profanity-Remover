@@ -1,9 +1,6 @@
 from faster_whisper import WhisperModel
 import torch
 
-# Cache settings
-MAX_CACHE_ITEMS = 100
-
 # Check if GPU is available
 try:
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -14,21 +11,33 @@ except ImportError:
     compute_type = "int8"
     print(f"🚀 Initializing Whisper model on CPU")
 
-model = WhisperModel("tiny", device=device, compute_type=compute_type, num_workers=4)
+# --- CHANGE 1: UPGRADE MODEL SIZE ---
+# "tiny" -> fast but dumb.
+# "small" -> good balance for lyrics.
+# "medium" -> best accuracy but slower.
+MODEL_SIZE = "small" 
+
+model = WhisperModel(
+    MODEL_SIZE, 
+    device=device,
+    compute_type=compute_type,
+    num_workers=4
+)
+
+print(f"✓ Whisper model loaded: {MODEL_SIZE} on {device}")
 
 def get_transcription_model():
     return model
 
-# Caches with basic size management
+# ... (Keep the cache dictionaries below) ...
 INSTRUMENTAL_CACHE = {}
 PERCUSSIVE_CACHE = {}
 VOCAL_CACHE = {}
 TRANSCRIPT_CACHE = {}
 
 def get_transcript_cache():
-    # Simple eviction policy: if too big, clear half
-    if len(TRANSCRIPT_CACHE) > MAX_CACHE_ITEMS:
-        keys = list(TRANSCRIPT_CACHE.keys())[:MAX_CACHE_ITEMS//2]
+    if len(TRANSCRIPT_CACHE) > 100:
+        keys = list(TRANSCRIPT_CACHE.keys())[:50]
         for k in keys: del TRANSCRIPT_CACHE[k]
     return TRANSCRIPT_CACHE
 
