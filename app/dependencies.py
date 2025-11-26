@@ -1,51 +1,37 @@
 from faster_whisper import WhisperModel
+import torch
 
+# Cache settings
+MAX_CACHE_ITEMS = 100
+
+# Check if GPU is available
 try:
-    import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
     print(f"🚀 Initializing Whisper model on {device.upper()}")
 except ImportError:
     device = "cpu"
     compute_type = "int8"
-    print(f"🚀 Initializing Whisper model on CPU (torch not installed)")
+    print(f"🚀 Initializing Whisper model on CPU")
 
-# Load the Whisper model with optimized settings
-model = WhisperModel(
-    "tiny",  
-    device=device,
-    compute_type=compute_type,
-    num_workers=4  # Parallel processing threads
-)
-
-print(f"✓ Whisper model loaded successfully: tiny on {device}")
+model = WhisperModel("tiny", device=device, compute_type=compute_type, num_workers=4)
 
 def get_transcription_model():
-    """Returns the pre-loaded Whisper transcription model"""
     return model
 
-
-# Cache for harmonic/instrumental tracks (melody and instruments)
+# Caches with basic size management
 INSTRUMENTAL_CACHE = {}
-
-def get_instrumental_cache():
-    """Returns cache for harmonic (instrumental) audio separation"""
-    return INSTRUMENTAL_CACHE
-
-
-# NEW: Cache for percussive tracks (drums and beats)
-# This is used to extract clean beats for filling censored sections
 PERCUSSIVE_CACHE = {}
-
-def get_percussive_cache():
-    """Returns cache for percussive (beat/drum) audio separation"""
-    return PERCUSSIVE_CACHE
-
-
-# Cache to store transcribed word lists between API calls
-# Maps: orig_path -> list of word dictionaries with timestamps
+VOCAL_CACHE = {}
 TRANSCRIPT_CACHE = {}
 
 def get_transcript_cache():
-    """Returns cache for storing transcription results between API calls"""
+    # Simple eviction policy: if too big, clear half
+    if len(TRANSCRIPT_CACHE) > MAX_CACHE_ITEMS:
+        keys = list(TRANSCRIPT_CACHE.keys())[:MAX_CACHE_ITEMS//2]
+        for k in keys: del TRANSCRIPT_CACHE[k]
     return TRANSCRIPT_CACHE
+
+def get_instrumental_cache(): return INSTRUMENTAL_CACHE
+def get_percussive_cache(): return PERCUSSIVE_CACHE
+def get_vocal_cache(): return VOCAL_CACHE

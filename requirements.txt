@@ -12,3 +12,4 @@ scipy
 diffusers
 librosa
 numpy
+# reverse
