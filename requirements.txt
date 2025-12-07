@@ -13,3 +13,4 @@ diffusers
 librosa
 numpy
 # reverse
+demucs
