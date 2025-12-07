@@ -13,6 +13,7 @@ from pydub import AudioSegment, effects
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
+# Ensure these are imported from your dependencies file
 from ..dependencies import (
     get_transcription_model, 
     get_transcript_cache, 
@@ -35,7 +36,8 @@ BAD_WORDS = {
     "bitch", "bitches", 
     "damn", "ass", "hoe", "hoes", "dick", "cock",
     "shit", "shitting", "pussy", "slut",
-    "nicka", "nickas", "nika", "nicker", "fck", "sht", "bih"
+    "nicka", "nickas", "nika", "nicker", "fck", "sht", "bih",
+    "hell", "whore"
 }
 
 # --- HELPERS ---
@@ -90,7 +92,7 @@ def separate_stems(input_path: str) -> dict:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
         print(f"Demucs Error: {e}")
-        raise HTTPException(500, "AI Stem Separation Failed.")
+        raise HTTPException(500, "AI Stem Separation Failed. Ensure Demucs/FFmpeg is installed.")
 
     filename_no_ext = os.path.splitext(os.path.basename(input_path))[0]
     result_dir = os.path.join(STEMS_OUTPUT_DIR, "htdemucs", filename_no_ext)
@@ -131,14 +133,25 @@ async def api_transcribe_audio(
     suffix = os.path.splitext(audio.filename)[1]
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
         shutil.copyfileobj(audio.file, temp_file)
-        temp_path = temp_file.name
+        full_song_path = temp_file.name
 
-    # Use VAD filter to ignore beats during transcription
+    # --- STEP 1: SEPARATE VOCALS FIRST ---
+    # We run Demucs NOW. This ensures Whisper hears clear vocals without drums.
+    try:
+        print("🚀 Isolating Vocals for Transcription...")
+        stems = separate_stems(full_song_path)
+        vocal_path_for_ai = stems["vocals"]
+    except Exception as e:
+        print(f"Stem Error: {e}")
+        vocal_path_for_ai = full_song_path # Fallback (not recommended)
+
+    # --- STEP 2: TRANSCRIBE ISOLATED VOCALS ---
+    print("🎤 Transcribing...")
     segments, _ = model.transcribe(
-        temp_path, 
+        vocal_path_for_ai, 
         beam_size=5, 
         word_timestamps=True,
-        vad_filter=True,
+        vad_filter=True, # Critical
         condition_on_previous_text=False
     )
     
@@ -165,8 +178,14 @@ async def api_transcribe_audio(
         })
         idx += 1
     
-    transcript_cache[temp_path] = final_words
-    return {"orig_path": temp_path, "words": final_words}
+    # --- CACHE THE STEMS ---
+    # We store the paths to the separated files so /process doesn't have to run Demucs again.
+    transcript_cache[full_song_path] = {
+        "words": final_words,
+        "stems": stems
+    }
+    
+    return {"orig_path": full_song_path, "words": final_words}
 
 @router.post("/process")
 async def api_process_precise(
@@ -175,35 +194,45 @@ async def api_process_precise(
     transcript_cache: dict = Depends(get_transcript_cache),
 ):
     if request.orig_path not in transcript_cache:
-        raise HTTPException(404, "Transcription not found.")
+        raise HTTPException(404, "Transcription not found. Please upload again.")
     
-    all_words = transcript_cache[request.orig_path]
+    # Retrieve Cached Data
+    cached_data = transcript_cache[request.orig_path]
+    all_words = cached_data["words"]
+    stems_paths = cached_data.get("stems")
+
     target_indices = set(request.remove_indices)
-    
     if request.max_effects:
         target_indices = set(sorted(list(target_indices))[:request.max_effects])
     
     words_to_process = [w for w in all_words if w['idx'] in target_indices]
     
     # ---------------------------------------------------------
-    # STEP 1: AI STEM SEPARATION
+    # STEP 1: LOAD STEMS
     # ---------------------------------------------------------
     try:
-        stems = separate_stems(request.orig_path)
-        vocal_track = AudioSegment.from_file(stems["vocals"])
-        instrumental_track = AudioSegment.from_file(stems["instrumental"])
+        # Check if stems exist from the /transcribe step
+        if stems_paths and os.path.exists(stems_paths["vocals"]):
+            print("✓ Using Cached Stems (Fast)")
+            vocal_track = AudioSegment.from_file(stems_paths["vocals"])
+            instrumental_track = AudioSegment.from_file(stems_paths["instrumental"])
+        else:
+            # Fallback: Process stems now (Slow)
+            print("⚠ Processing Stems (Cache Miss)")
+            stems = separate_stems(request.orig_path)
+            vocal_track = AudioSegment.from_file(stems["vocals"])
+            instrumental_track = AudioSegment.from_file(stems["instrumental"])
     except Exception as e:
-        print(e)
-        raise HTTPException(500, "Failed to separate stems.")
+        raise HTTPException(500, f"Processing Error: {e}")
 
     # ---------------------------------------------------------
-    # STEP 2: EDIT THE VOCAL TRACK (INSTRUMENTAL DROP TECHNIQUE)
+    # STEP 2: EDIT VOCALS (SILENCE)
     # ---------------------------------------------------------
     
     # Sort reverse so index slicing doesn't break
     words_to_process.sort(key=lambda x: x['start'], reverse=True)
 
-    # Padding: 80ms to catch the edges of words
+    # Padding: 80ms to catch start/end articulation
     PAD = 80
 
     for word in words_to_process:
@@ -215,28 +244,24 @@ async def api_process_precise(
         e_ms = min(len(vocal_track), e_ms + PAD)
         duration_ms = e_ms - s_ms
         
-        # --- THE FIX ---
-        # Instead of Reversing, we replace the vocal word with SILENCE.
-        # This creates a "hole" in the vocal track.
-        # When overlayed on the instrumental, the instrumental will shine through.
+        # METHOD: SILENCE (Instrumental shines through)
+        # This replaces the word with absolute silence on the vocal track.
         clean_slice = AudioSegment.silent(duration=duration_ms)
         
-        # We apply a fade OUT to the audio before the cut, and a fade IN after.
-        # This prevents the "click/pop" sound.
-        fade_len = request.fade_duration # 15ms is usually perfect
+        # Fade edges (15ms)
+        fade_len = request.fade_duration
         
-        # Cut and fade the remaining vocal parts
+        # Cut and fade
         vocal_before = vocal_track[:s_ms].fade_out(fade_len)
         vocal_after = vocal_track[e_ms:].fade_in(fade_len)
         
-        # Reassemble Vocal Track
+        # Reassemble
         vocal_track = vocal_before + clean_slice + vocal_after
 
     # ---------------------------------------------------------
     # STEP 3: MERGE (Seamless Playback)
     # ---------------------------------------------------------
-    # We overlay the "Holey" Vocals onto the "Continuous" Instrumental.
-    # The beat never stops because instrumental_track was never touched.
+    # Overlay Muted Vocals + Untouched Instrumental
     final_mix = instrumental_track.overlay(vocal_track)
 
     # ---------------------------------------------------------
@@ -256,16 +281,4 @@ async def api_process_precise(
     
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as out_fp:
         final_mix.export(out_fp.name, format='mp3', bitrate='320k', parameters=["-q:a", "0"])
-        
-        # Cleanup
-        try:
-            shutil.rmtree(STEMS_OUTPUT_DIR)
-            os.makedirs(STEMS_OUTPUT_DIR, exist_ok=True)
-        except: pass
-        
-        return FileResponse(
-            out_fp.name, 
-            media_type='audio/mpeg', 
-            filename=out_filename,
-            headers={"X-Effects-Applied": str(len(words_to_process))}
-        )
+        return FileResponse(out_fp.name, media_type='audio/mpeg', filename=out_filename)

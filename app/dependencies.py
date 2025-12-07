@@ -15,7 +15,7 @@ except ImportError:
 # "tiny" -> fast but dumb.
 # "small" -> good balance for lyrics.
 # "medium" -> best accuracy but slower.
-MODEL_SIZE = "small" 
+MODEL_SIZE = "large-v3" 
 
 model = WhisperModel(
     MODEL_SIZE, 
