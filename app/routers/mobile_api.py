@@ -4,7 +4,7 @@ import shutil
 import io
 import re
 import subprocess
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from enum import Enum
 
 from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, BackgroundTasks
@@ -24,7 +24,6 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DJ_TAG_PATH = os.path.join(BASE_DIR, '..', 'dj', 'dj dj gudda.mp3')
 STEMS_OUTPUT_DIR = os.path.join(BASE_DIR, 'temp_stems')
 
-# Ensure temp directory exists
 os.makedirs(STEMS_OUTPUT_DIR, exist_ok=True)
 
 DJ_TAG = None
@@ -37,7 +36,7 @@ BAD_WORDS = {
     "damn", "ass", "hoe", "hoes", "dick", "cock",
     "shit", "shitting", "pussy", "slut",
     "nicka", "nickas", "nika", "nicker", "fck", "sht", "bih",
-    "hell", "whore"
+    "hell", "whore", "ass,", "ass."
 }
 
 # --- HELPERS ---
@@ -46,13 +45,13 @@ def load_assets():
     global DJ_TAG
     if DJ_TAG is None and os.path.exists(DJ_TAG_PATH):
         raw = AudioSegment.from_file(DJ_TAG_PATH).normalize()
-        # Compress DJ Tag
         DJ_TAG = effects.compress_dynamic_range(raw, threshold=-10.0, ratio=3.0)
         DJ_TAG = DJ_TAG.fade_in(10).fade_out(100)
         print("✓ DJ Tag Loaded & Mastered")
 
 def normalize_text(text: str) -> str:
-    return re.sub(r'[^a-zA-Z\s]', '', text).lower().strip()
+    # Aggressive cleaning: remove everything that isn't a letter
+    return re.sub(r'[^a-z]', '', text.lower())
 
 def clean_hallucinations(words: List[dict]) -> List[dict]:
     cleaned = []
@@ -72,14 +71,7 @@ def clean_hallucinations(words: List[dict]) -> List[dict]:
     return cleaned
 
 def separate_stems(input_path: str) -> dict:
-    """
-    Separates audio using Demucs.
-    Returns: {'vocals': path, 'instrumental': path}
-    """
     print(f"🚀 Starting AI Separation for: {input_path}")
-    
-    # -n htdemucs: High Quality
-    # --two-stems=vocals: Splits into 'vocals.wav' and 'no_vocals.wav' (Instrumental)
     cmd = [
         "demucs",
         "-n", "htdemucs", 
@@ -87,12 +79,11 @@ def separate_stems(input_path: str) -> dict:
         str(input_path),
         "-o", STEMS_OUTPUT_DIR
     ]
-    
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
         print(f"Demucs Error: {e}")
-        raise HTTPException(500, "AI Stem Separation Failed. Ensure Demucs/FFmpeg is installed.")
+        raise HTTPException(500, "AI Stem Separation Failed.")
 
     filename_no_ext = os.path.splitext(os.path.basename(input_path))[0]
     result_dir = os.path.join(STEMS_OUTPUT_DIR, "htdemucs", filename_no_ext)
@@ -101,6 +92,16 @@ def separate_stems(input_path: str) -> dict:
         "vocals": os.path.join(result_dir, "vocals.wav"),
         "instrumental": os.path.join(result_dir, "no_vocals.wav")
     }
+
+def generate_reverb_tail(source_segment: AudioSegment, target_duration_ms: int) -> AudioSegment:
+    """Generates a smooth ghost tail from the previous word."""
+    tail_seed = source_segment[-50:] 
+    loops_needed = (target_duration_ms // 50) + 1
+    ghost_fill = tail_seed * loops_needed
+    ghost_fill = ghost_fill[:target_duration_ms]
+    ghost_fill = ghost_fill.fade_out(target_duration_ms)
+    ghost_fill = ghost_fill - 6.0
+    return ghost_fill
 
 # --- ROUTER ---
 router = APIRouter(prefix="/api/v2", tags=["Mobile API v2"])
@@ -117,7 +118,7 @@ class ProcessRequest(BaseModel):
     effect_type: EffectType = EffectType.DJ_TAG
     max_effects: Optional[int] = None
     effect_volume: float = 0.0
-    fade_duration: int = 15 # 15ms fade avoids clicking
+    fade_duration: int = 15
     tag_start_time: float = 0.0 
 
 @router.on_event("startup")
@@ -135,29 +136,28 @@ async def api_transcribe_audio(
         shutil.copyfileobj(audio.file, temp_file)
         full_song_path = temp_file.name
 
-    # --- STEP 1: SEPARATE VOCALS FIRST ---
-    # We run Demucs NOW. This ensures Whisper hears clear vocals without drums.
+    # Step 1: Separate Vocals
     try:
-        print("🚀 Isolating Vocals for Transcription...")
+        print("🚀 Isolating Vocals...")
         stems = separate_stems(full_song_path)
         vocal_path_for_ai = stems["vocals"]
-    except Exception as e:
-        print(f"Stem Error: {e}")
-        vocal_path_for_ai = full_song_path # Fallback (not recommended)
+    except Exception:
+        vocal_path_for_ai = full_song_path 
 
-    # --- STEP 2: TRANSCRIBE ISOLATED VOCALS ---
+    # Step 2: Transcribe
     print("🎤 Transcribing...")
     segments, _ = model.transcribe(
         vocal_path_for_ai, 
         beam_size=5, 
         word_timestamps=True,
-        vad_filter=True, # Critical
+        vad_filter=True,
         condition_on_previous_text=False
     )
     
     raw_words = []
     for seg in segments:
         for w in seg.words:
+            # Clean punctuation logic moved to normalize_text
             t = w.word.strip()
             if not t: continue
             raw_words.append({'text': t, 'start': w.start, 'end': w.end})
@@ -168,7 +168,16 @@ async def api_transcribe_audio(
     idx = 0
     for w in cleaned_words_data:
         clean_text = normalize_text(w['text'])
-        is_profanity = clean_text in BAD_WORDS
+        
+        # IMPROVED DETECTION
+        is_profanity = False
+        if clean_text in BAD_WORDS:
+            is_profanity = True
+        # Catch compound words like "dumbass" or "jackass"
+        elif "ass" in clean_text and len(clean_text) > 3: 
+             if any(x in clean_text for x in ["dumb", "jack", "kick", "kiss", "bad"]):
+                 is_profanity = True
+
         final_words.append({
             'idx': idx,
             'text': w['text'],
@@ -178,8 +187,6 @@ async def api_transcribe_audio(
         })
         idx += 1
     
-    # --- CACHE THE STEMS ---
-    # We store the paths to the separated files so /process doesn't have to run Demucs again.
     transcript_cache[full_song_path] = {
         "words": final_words,
         "stems": stems
@@ -194,9 +201,8 @@ async def api_process_precise(
     transcript_cache: dict = Depends(get_transcript_cache),
 ):
     if request.orig_path not in transcript_cache:
-        raise HTTPException(404, "Transcription not found. Please upload again.")
+        raise HTTPException(404, "Transcription not found.")
     
-    # Retrieve Cached Data
     cached_data = transcript_cache[request.orig_path]
     all_words = cached_data["words"]
     stems_paths = cached_data.get("stems")
@@ -207,66 +213,56 @@ async def api_process_precise(
     
     words_to_process = [w for w in all_words if w['idx'] in target_indices]
     
-    # ---------------------------------------------------------
-    # STEP 1: LOAD STEMS
-    # ---------------------------------------------------------
+    # 1. Load Stems
     try:
-        # Check if stems exist from the /transcribe step
         if stems_paths and os.path.exists(stems_paths["vocals"]):
-            print("✓ Using Cached Stems (Fast)")
             vocal_track = AudioSegment.from_file(stems_paths["vocals"])
             instrumental_track = AudioSegment.from_file(stems_paths["instrumental"])
         else:
-            # Fallback: Process stems now (Slow)
-            print("⚠ Processing Stems (Cache Miss)")
             stems = separate_stems(request.orig_path)
             vocal_track = AudioSegment.from_file(stems["vocals"])
             instrumental_track = AudioSegment.from_file(stems["instrumental"])
     except Exception as e:
         raise HTTPException(500, f"Processing Error: {e}")
 
-    # ---------------------------------------------------------
-    # STEP 2: EDIT VOCALS (SILENCE)
-    # ---------------------------------------------------------
-    
-    # Sort reverse so index slicing doesn't break
+    # 2. Edit Vocals
     words_to_process.sort(key=lambda x: x['start'], reverse=True)
-
-    # Padding: 80ms to catch start/end articulation
-    PAD = 80
+    
+    # WIDER PADDING for short words like "Ass"
+    PAD_START = 50
+    PAD_END = 150
 
     for word in words_to_process:
         s_ms = int(word['start'] * 1000)
         e_ms = int(word['end'] * 1000)
         
-        # Apply safety padding
-        s_ms = max(0, s_ms - PAD)
-        e_ms = min(len(vocal_track), e_ms + PAD)
+        s_ms = max(0, s_ms - PAD_START)
+        e_ms = min(len(vocal_track), e_ms + PAD_END)
         duration_ms = e_ms - s_ms
         
-        # METHOD: SILENCE (Instrumental shines through)
-        # This replaces the word with absolute silence on the vocal track.
-        clean_slice = AudioSegment.silent(duration=duration_ms)
+        # Get context for ghost fill
+        context_start = max(0, s_ms - 500)
+        previous_context = vocal_track[context_start:s_ms]
         
-        # Fade edges (15ms)
+        # Generate Ghost Fill (Spectral Repair)
+        ghost_fill = AudioSegment.silent(duration=duration_ms)
+        if len(previous_context) > 50:
+            ghost_fill = generate_reverb_tail(previous_context, duration_ms)
+            
         fade_len = request.fade_duration
-        
-        # Cut and fade
         vocal_before = vocal_track[:s_ms].fade_out(fade_len)
         vocal_after = vocal_track[e_ms:].fade_in(fade_len)
         
-        # Reassemble
-        vocal_track = vocal_before + clean_slice + vocal_after
+        vocal_track = vocal_before + ghost_fill + vocal_after
 
-    # ---------------------------------------------------------
-    # STEP 3: MERGE (Seamless Playback)
-    # ---------------------------------------------------------
-    # Overlay Muted Vocals + Untouched Instrumental
+    # 3. Merge
     final_mix = instrumental_track.overlay(vocal_track)
+    
+    # Ensure full length (Fixes Outro Bug)
+    if len(final_mix) < len(instrumental_track):
+         final_mix += AudioSegment.silent(duration=len(instrumental_track) - len(final_mix))
 
-    # ---------------------------------------------------------
-    # STEP 4: DJ TAG (Once at Start/Drop)
-    # ---------------------------------------------------------
+    # 4. Tag
     if request.effect_type == EffectType.DJ_TAG and DJ_TAG:
         tag_time_ms = int(request.tag_start_time * 1000)
         if tag_time_ms < len(final_mix) - 1000:
